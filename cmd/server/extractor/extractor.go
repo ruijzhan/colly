@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -23,15 +24,22 @@ var (
 	scoreLikeRE = regexp.MustCompile(`^\d+\.?[\d]*[kK]?$`)
 )
 
+// Comment represents a Reddit comment with nested replies.
+type Comment struct {
+	Body    string    `json:"body"`
+	Replies []Comment `json:"replies,omitempty"`
+}
+
 // RedditPost represents extracted information from a Reddit post.
 type RedditPost struct {
 	Title         string   `json:"title"`
 	Author        string   `json:"author"`
 	PublishedTime string   `json:"published_time"`
 	Score         string   `json:"score"`
-	Comments      string   `json:"comments"`
+	CommentCount  string   `json:"comment_count"`
 	Content       string   `json:"content"`
 	Images        []string `json:"images"`
+	Comments      []Comment `json:"comments"`
 }
 
 // RedditAPIResponse represents the structure of Reddit's JSON API response.
@@ -138,13 +146,20 @@ func extractRedditPostFromAPI(ctx context.Context, redditURL string) (*RedditPos
 		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
+	// Read the entire response body first to enable multiple parsing passes
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
 	var apiResponse RedditAPIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+	if err := json.Unmarshal(bodyBytes, &apiResponse); err != nil {
 		return nil, err
 	}
 
 	post := &RedditPost{}
 
+	// First pass: Extract post data from the first element (t3 post)
 	for _, item := range apiResponse {
 		if item.Kind != "Listing" {
 			continue
@@ -156,7 +171,7 @@ func extractRedditPostFromAPI(ctx context.Context, redditURL string) (*RedditPos
 			post.Title = child.Data.Title
 			post.Author = child.Data.Author
 			post.Score = fmt.Sprintf("%d", child.Data.Score)
-			post.Comments = fmt.Sprintf("%d", child.Data.NumComments)
+			post.CommentCount = fmt.Sprintf("%d", child.Data.NumComments)
 			post.Content = child.Data.Selftext
 
 			if child.Data.CreatedUTC > 0 {
@@ -173,12 +188,68 @@ func extractRedditPostFromAPI(ctx context.Context, redditURL string) (*RedditPos
 			} else if isRedditImageURL(child.Data.URL) {
 				post.Images = append(post.Images, child.Data.URL)
 			}
+		}
+	}
 
-			return post, nil
+	// Second pass: Extract comments from the second element (t1 comments)
+	if len(apiResponse) >= 2 {
+		var rawResponse []json.RawMessage
+		if err := json.Unmarshal(bodyBytes, &rawResponse); err == nil && len(rawResponse) >= 2 {
+			var commentsListing struct {
+				Kind string `json:"kind"`
+				Data struct {
+					Children []json.RawMessage `json:"children"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rawResponse[1], &commentsListing); err == nil {
+				post.Comments = parseCommentListings(commentsListing.Data.Children)
+			}
 		}
 	}
 
 	return post, nil
+}
+
+// parseCommentListings parses comment listings from raw JSON messages.
+func parseCommentListings(children []json.RawMessage) []Comment {
+	comments := make([]Comment, 0, len(children))
+	for _, childRaw := range children {
+		var child struct {
+			Kind string `json:"kind"`
+			Data struct {
+				Body    string          `json:"body"`
+				Replies json.RawMessage `json:"replies"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(childRaw, &child); err != nil {
+			continue
+		}
+		if child.Kind != "t1" {
+			continue
+		}
+
+		comment := Comment{
+			Body: child.Data.Body,
+		}
+
+		// Parse nested replies
+		if len(child.Data.Replies) > 0 && string(child.Data.Replies) != `""` && string(child.Data.Replies) != "" {
+			var replies struct {
+				Kind string `json:"kind"`
+				Data struct {
+					Children []json.RawMessage `json:"children"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(child.Data.Replies, &replies); err == nil {
+				if replies.Kind == "Listing" && len(replies.Data.Children) > 0 {
+					comment.Replies = parseCommentListings(replies.Data.Children)
+				}
+			}
+		}
+
+		comments = append(comments, comment)
+	}
+	return comments
 }
 
 func extractRedditPostFromHTML(ctx context.Context, redditURL string) (*RedditPost, error) {
@@ -222,11 +293,11 @@ func extractRedditPostFromHTML(ctx context.Context, redditURL string) (*RedditPo
 	})
 
 	c.OnHTML(`shreddit-post div[3] button span span[2] faceplate-number`, func(e *colly.HTMLElement) {
-		setIfEmpty(&post.Comments, strings.TrimSpace(e.Text))
+		setIfEmpty(&post.CommentCount, strings.TrimSpace(e.Text))
 	})
 
 	c.OnHTML(`button span span faceplate-number`, func(e *colly.HTMLElement) {
-		if post.Comments != "" {
+		if post.CommentCount != "" {
 			return
 		}
 		commentsText := strings.TrimSpace(e.Text)
@@ -236,7 +307,7 @@ func extractRedditPostFromHTML(ctx context.Context, redditURL string) (*RedditPo
 		parent := e.DOM.Parent()
 		buttonParent := parent.Parent()
 		if buttonParent.Is("button") {
-			post.Comments = commentsText
+			post.CommentCount = commentsText
 		}
 	})
 
