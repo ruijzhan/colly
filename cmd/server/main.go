@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -21,6 +23,9 @@ type apiResponse struct {
 }
 
 func main() {
+	port := flag.Int("port", 8080, "port to listen on")
+	flag.Parse()
+
 	router := gin.Default()
 
 	router.POST("/extract", func(c *gin.Context) {
@@ -59,5 +64,5 @@ func main() {
 		})
 	})
 
-	_ = router.Run(":8080")
+	_ = router.Run(fmt.Sprintf(":%d", *port))
 }
