@@ -45,6 +45,7 @@ temp/
 # Debug files
 debug
 *.debug
+__debug_bin*
 
 # Compiled Object files
 *.o
