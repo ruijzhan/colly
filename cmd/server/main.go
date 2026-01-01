@@ -37,7 +37,7 @@ func main() {
 
 	router := gin.Default()
 
-	router.POST("/extract", func(c *gin.Context) {
+	router.POST("/api/reddit/extract", func(c *gin.Context) {
 		var req extractRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, apiResponse{
